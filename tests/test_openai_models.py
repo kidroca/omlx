@@ -73,6 +73,21 @@ class TestContentPart:
         assert part.file.filename == "sample.pdf"
         assert part.file.file_data.endswith("ZA==")
 
+    def test_video_url_content_part_preserves_inline_video(self):
+        """OpenAI-compatible video_url parts must survive request validation."""
+        part = ContentPart.model_validate(
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": "data:video/mp4;base64,AAAA",
+                },
+            }
+        )
+
+        assert part.type == "video_url"
+        assert part.video_url is not None
+        assert part.video_url.url == "data:video/mp4;base64,AAAA"
+
 
 class TestMessage:
     """Tests for Message model."""

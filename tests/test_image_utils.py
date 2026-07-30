@@ -2,12 +2,14 @@
 """Tests for utils/image.py — image loading, extraction, and hashing."""
 
 import base64
+import hashlib
 import io
 from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
 
+import omlx.utils.image as image_utils
 from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import (
     compute_image_hash,
@@ -417,6 +419,258 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         # Text content should be preserved
         assert "Describe this image and audio" in text_msgs[0]["content"]
+
+
+class TestExtractMediaFromMessages:
+    """Tests for native inline-video extraction."""
+
+    def test_video_url_is_decoded_loaded_and_removed_from_text(self):
+        raw_video = b"small synthetic mp4 payload"
+        uri = "data:video/mp4;base64," + base64.b64encode(raw_video).decode()
+        observed = {}
+
+        def fake_load_video(path, *, field):
+            observed["path"] = path
+            with open(path, "rb") as video_file:
+                observed["bytes"] = video_file.read()
+            observed["field"] = field
+            return "frames", 1.75
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                    {"type": "text", "text": "Describe this video"},
+                ],
+            }
+        ]
+
+        with patch(
+            "omlx.utils.image._load_video_file_bounded", side_effect=fake_load_video
+        ):
+            text_msgs, images, audio, videos = image_utils.extract_media_from_messages(
+                messages
+            )
+
+        assert text_msgs == [{"role": "user", "content": "Describe this video"}]
+        assert images == []
+        assert audio == []
+        assert len(videos) == 1
+        assert videos[0].frames == "frames"
+        assert videos[0].fps == 1.75
+        assert videos[0].content_hash == hashlib.sha256(raw_video).hexdigest()
+        assert observed["bytes"] == raw_video
+        assert observed["field"] == "video_url.url"
+        assert not __import__("pathlib").Path(observed["path"]).exists()
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"width": float("nan"), "height": 1080, "fps": 30.0, "total_frames": 30},
+            {"width": 0, "height": 1080, "fps": 30.0, "total_frames": 30},
+            {"width": 4097, "height": 1, "fps": 30.0, "total_frames": 30},
+            {"width": 1920, "height": 1080, "fps": 121.0, "total_frames": 30},
+            {"width": 1920, "height": 1080, "fps": 30.0, "total_frames": 36_001},
+            {"width": 1920, "height": 1080, "fps": 30.0, "total_frames": 9_001},
+            {"width": 4096, "height": 2160, "fps": 30.0, "total_frames": 300},
+        ],
+    )
+    def test_video_metadata_limits_fail_closed(self, metadata):
+        with pytest.raises(InvalidRequestError):
+            image_utils._validated_video_sample_count(**metadata, field="video_url.url")
+
+    def test_video_decode_rejects_output_size_that_disagrees_with_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        cv2 = pytest.importorskip("cv2")
+        np = pytest.importorskip("numpy")
+
+        class FakeCapture:
+            def isOpened(self):  # noqa: N802 - mirrors cv2.VideoCapture
+                return True
+
+            def get(self, prop):
+                return {
+                    cv2.CAP_PROP_FRAME_WIDTH: 2,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 2,
+                    cv2.CAP_PROP_FPS: 2.0,
+                    cv2.CAP_PROP_FRAME_COUNT: 4,
+                }[prop]
+
+            def set(self, prop, value):
+                return True
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(cv2, "VideoCapture", lambda path: FakeCapture())
+
+        def fake_run(command, **kwargs):
+            with open(command[-1], "wb") as output_file:
+                output_file.write(b"short")
+            return type("Result", (), {"returncode": 0})()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        output_path = tmp_path / "frames.bin"
+        with pytest.raises(InvalidRequestError, match="decodable video"):
+            image_utils._decode_video_file_to_memmap(
+                "ignored.mp4", str(output_path), field="video_url.url"
+            )
+
+    def test_video_decode_preallocates_output_without_stacking(
+        self, monkeypatch, tmp_path
+    ):
+        cv2 = pytest.importorskip("cv2")
+        np = pytest.importorskip("numpy")
+
+        class FakeCapture:
+            def isOpened(self):  # noqa: N802 - mirrors cv2.VideoCapture
+                return True
+
+            def get(self, prop):
+                return {
+                    cv2.CAP_PROP_FRAME_WIDTH: 2,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 2,
+                    cv2.CAP_PROP_FPS: 2.0,
+                    cv2.CAP_PROP_FRAME_COUNT: 4,
+                }[prop]
+
+            def set(self, prop, value):
+                return True
+
+            def read(self):
+                return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+            def release(self):
+                pass
+
+        monkeypatch.setattr(cv2, "VideoCapture", lambda path: FakeCapture())
+        monkeypatch.setattr(
+            np,
+            "stack",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("decode must not stack retained frames")
+            ),
+        )
+
+        def fake_run(command, **kwargs):
+            assert command[command.index("-max_alloc") + 1] == str(
+                image_utils.MAX_VIDEO_DECODER_ALLOCATION_BYTES
+            )
+            assert command[command.index("-threads") + 1] == "1"
+            assert command[command.index("-frames:v") + 1] == "4"
+            assert kwargs["timeout"] == image_utils.VIDEO_DECODE_TIMEOUT_SECONDS
+            assert kwargs["stdin"] is __import__("subprocess").DEVNULL
+            assert kwargs["stdout"] is __import__("subprocess").DEVNULL
+            assert kwargs["stderr"] is __import__("subprocess").DEVNULL
+            with open(command[-1], "wb") as output_file:
+                output_file.write(bytes(4 * 2 * 2 * 3))
+            return type("Result", (), {"returncode": 0})()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        output_path = tmp_path / "frames.bin"
+        shape, fps = image_utils._decode_video_file_to_memmap(
+            "ignored.mp4", str(output_path), field="video_url.url"
+        )
+
+        assert shape == (4, 2, 2, 3)
+        assert fps == 2.0
+
+    def test_video_decode_runs_with_decoder_allocation_cap(self, tmp_path):
+        cv2 = pytest.importorskip("cv2")
+        np = pytest.importorskip("numpy")
+
+        if not __import__("pathlib").Path(image_utils.FFMPEG_BINARY).is_file():
+            pytest.skip("fixed ffmpeg binary is unavailable")
+
+        video_path = tmp_path / "tiny.avi"
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            2.0,
+            (16, 16),
+        )
+        if not writer.isOpened():
+            pytest.skip("OpenCV MJPG writer is unavailable")
+        for value in (0, 64, 128, 255):
+            writer.write(np.full((16, 16, 3), value, dtype=np.uint8))
+        writer.release()
+
+        frames, fps = image_utils._load_video_file_bounded(
+            str(video_path), field="video_url.url"
+        )
+
+        assert frames.shape == (4, 3, 16, 16)
+        assert fps == pytest.approx(2.0)
+        assert isinstance(frames, np.memmap)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/video.mp4",
+            "/tmp/video.mp4",
+            "data:image/png;base64,AAAA",
+            "data:video/mp4;base64,not-valid-base64!!!",
+        ],
+    )
+    def test_video_url_rejects_non_inline_or_malformed_inputs(self, url):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_more_than_one_video(self):
+        uri = "data:video/mp4;base64," + base64.b64encode(b"video").decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="one video"):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_video_outside_user_message(self):
+        uri = "data:video/mp4;base64," + base64.b64encode(b"video").decode()
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="user messages"):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_oversized_video_before_decode(self, monkeypatch):
+        monkeypatch.setattr(image_utils, "MAX_VIDEO_BYTES", 3)
+        uri = "data:video/mp4;base64," + base64.b64encode(b"four").decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="exceeds"):
+            image_utils.extract_media_from_messages(messages)
 
 
 # =============================================================================
