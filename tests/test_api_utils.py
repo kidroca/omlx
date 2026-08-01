@@ -2854,6 +2854,25 @@ class TestExtractMultimodalContent:
             {"type": "video_url", "video_url": {"url": url}},
         ]
 
+    def test_video_url_sampling_controls_survive_normalization(self):
+        """Validated sampling controls must reach engine-side video decoding."""
+        url = "data:video/mp4;base64,AAAA"
+        parts = _extract_multimodal_content_list(
+            [
+                ContentPart(
+                    type="video_url",
+                    video_url={"url": url, "fps": 15.0, "max_frames": 74},
+                )
+            ]
+        )
+
+        assert parts == [
+            {
+                "type": "video_url",
+                "video_url": {"url": url, "fps": 15.0, "max_frames": 74},
+            }
+        ]
+
     @pytest.mark.parametrize(
         "video_url",
         [None, {}, {"url": None}, {"url": ""}, {"url": 123}],

@@ -231,10 +231,16 @@ def _extract_multimodal_content_list(content: list) -> list:
                         "video_url.url must be a non-empty string.",
                         field="video_url.url",
                     )
+                normalized_video_url: dict[str, Any] = {"url": url}
+                if isinstance(video_url_value, dict):
+                    for control in ("fps", "max_frames"):
+                        value = video_url_value.get(control)
+                        if value is not None:
+                            normalized_video_url[control] = value
                 parts.append(
                     {
                         "type": "video_url",
-                        "video_url": {"url": url},
+                        "video_url": normalized_video_url,
                     }
                 )
     return parts
