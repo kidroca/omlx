@@ -672,6 +672,52 @@ class TestExtractMediaFromMessages:
         with pytest.raises(InvalidRequestError, match="exceeds"):
             image_utils.extract_media_from_messages(messages)
 
+    def test_explicit_15fps_150_frame_sampling_fits_one_gibibyte(self):
+        sample_count = image_utils._validated_video_sample_count(
+            width=1502,
+            height=1152,
+            fps=30.0,
+            total_frames=300,
+            field="video_url.url",
+            requested_fps=15.0,
+            requested_max_frames=150,
+            max_decoded_bytes=1024**3,
+        )
+
+        assert sample_count == 150
+
+    def test_explicit_15fps_30_second_single_chunk_exceeds_one_gibibyte(self):
+        with pytest.raises(InvalidRequestError, match="decoded video limits"):
+            image_utils._validated_video_sample_count(
+                width=1502,
+                height=1152,
+                fps=30.0,
+                total_frames=900,
+                field="video_url.url",
+                requested_fps=15.0,
+                requested_max_frames=450,
+                max_decoded_bytes=1024**3,
+            )
+
+    @pytest.mark.parametrize(
+        ("requested_fps", "requested_max_frames"),
+        [(16.01, 150), (15.0, 769), (0.0, 150), (15.0, 1), (True, 150)],
+    )
+    def test_explicit_sampling_controls_are_hard_bounded(
+        self, requested_fps, requested_max_frames
+    ):
+        with pytest.raises(InvalidRequestError):
+            image_utils._validated_video_sample_count(
+                width=640,
+                height=480,
+                fps=30.0,
+                total_frames=300,
+                field="video_url.url",
+                requested_fps=requested_fps,
+                requested_max_frames=requested_max_frames,
+                max_decoded_bytes=1024**3,
+            )
+
 
 # =============================================================================
 # Tests: compute_image_hash

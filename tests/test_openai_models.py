@@ -32,6 +32,7 @@ from omlx.api.openai_models import (
     ToolCall,
     ToolDefinition,
     Usage,
+    VideoURL,
 )
 
 
@@ -44,6 +45,16 @@ class TestContentPart:
 
         assert part.type == "text"
         assert part.text == "Hello world"
+
+    def test_video_url_preserves_bounded_sampling_controls(self):
+        video = VideoURL(
+            url="data:video/mp4;base64,AAAA",
+            fps=15.0,
+            max_frames=150,
+        )
+
+        assert video.fps == 15.0
+        assert video.max_frames == 150
 
     def test_text_content_part_empty_text(self):
         """Test creating text content part with empty text."""

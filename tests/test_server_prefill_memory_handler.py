@@ -97,6 +97,135 @@ class TestPrefillMemoryHandler:
 
 class TestPostCommitPrefillMemorySurface:
     @pytest.mark.asyncio
+    async def test_prefetch_propagates_native_media_error_before_response(self):
+        import omlx.server as srv
+        from omlx.exceptions import InvalidRequestError
+
+        async def _raise_before_first_item():
+            raise InvalidRequestError(
+                "video_url.url exceeds safe decoded video limits.",
+                field="video_url.url",
+            )
+            yield "unreachable"
+
+        with pytest.raises(InvalidRequestError, match="decoded video limits"):
+            await srv._prefetch_async_iterator(_raise_before_first_item())
+
+    @pytest.mark.asyncio
+    async def test_prefetch_replays_first_item_without_loss(self):
+        import omlx.server as srv
+
+        async def _items():
+            yield "first"
+            yield "second"
+
+        replay = await srv._prefetch_async_iterator(_items())
+
+        assert [item async for item in replay] == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_advances_engine_before_role_chunk(self):
+        import omlx.server as srv
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.exceptions import InvalidRequestError
+
+        class _Engine:
+            tokenizer = None
+
+            async def stream_chat(self, **_kwargs):
+                raise InvalidRequestError(
+                    "video_url.url exceeds safe decoded video limits.",
+                    field="video_url.url",
+                )
+                yield None
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="test")],
+            stream=True,
+        )
+        stream = srv.stream_chat_completion(_Engine(), [], request)
+
+        with pytest.raises(InvalidRequestError, match="decoded video limits"):
+            await stream.__anext__()
+
+    def test_chat_route_returns_400_when_first_engine_advance_rejects_media(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import omlx.server as srv
+        from omlx.exceptions import InvalidRequestError
+
+        engine = MagicMock()
+        engine.tokenizer = None
+        engine.model_type = None
+        engine.count_chat_tokens.return_value = 1
+        engine.preflight_chat = AsyncMock(return_value=None)
+
+        async def _raising_stream(**_kwargs):
+            raise InvalidRequestError(
+                "video_url.url exceeds safe decoded video limits.",
+                field="video_url.url",
+            )
+            yield None
+
+        engine.stream_chat = _raising_stream
+
+        async def _get_engine_for_model(_model_id, *, lease=None):
+            return engine
+
+        fake_pool = MagicMock()
+        fake_pool.get_entry.return_value = None
+        original_overrides = dict(srv.app.dependency_overrides)
+        try:
+            srv.app.dependency_overrides[srv.verify_api_key] = lambda: True
+            with (
+                patch.object(srv, "get_engine_for_model", _get_engine_for_model),
+                patch.object(srv, "get_engine_pool", return_value=fake_pool),
+                patch.object(srv, "resolve_model_id", lambda name: name),
+                patch.object(srv, "validate_context_window", lambda *a, **k: None),
+                TestClient(srv.app, raise_server_exceptions=False) as client,
+            ):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "test"}],
+                        "stream": True,
+                    },
+                )
+        finally:
+            srv.app.dependency_overrides.clear()
+            srv.app.dependency_overrides.update(original_overrides)
+
+        assert response.status_code == 400, response.text
+        assert "decoded video limits" in response.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_guard_cancels_non_streaming_work(self):
+        import asyncio
+
+        import omlx.server as srv
+
+        cancelled = asyncio.Event()
+
+        class _DisconnectedRequest:
+            async def is_disconnected(self):
+                return True
+
+        async def _work():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        result = await srv._run_with_disconnect_guard(
+            _DisconnectedRequest(), _work(), poll_interval=0.001
+        )
+
+        assert result is None
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
     async def test_json_keepalive_emits_openai_error_body(self):
         import json
 
@@ -244,9 +373,9 @@ class TestResponsesEndpointReaches400:
                             "stream": False,
                         },
                     )
-            assert (
-                resp.status_code == 400
-            ), f"expected 400, got {resp.status_code}: {resp.text}"
+            assert resp.status_code == 400, (
+                f"expected 400, got {resp.status_code}: {resp.text}"
+            )
             body = resp.json()
             assert "error" in body, body
             assert "Prefill would require" in body["error"]["message"]

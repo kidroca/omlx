@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, TypeVar, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -1089,6 +1089,23 @@ async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
                 "context or after memory pressure drops."
             ),
         )
+
+
+_PrefetchItem = TypeVar("_PrefetchItem")
+
+
+async def _prefetch_async_iterator(
+    generator: AsyncIterator[_PrefetchItem],
+) -> AsyncIterator[_PrefetchItem]:
+    """Run work through the first item before any response is constructed."""
+    first = await generator.__anext__()
+
+    async def _replay() -> AsyncIterator[_PrefetchItem]:
+        yield first
+        async for item in generator:
+            yield item
+
+    return _replay()
 
 
 async def _release_after_stream(
@@ -3097,11 +3114,11 @@ async def create_completion(
             )
 
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
@@ -3515,18 +3532,21 @@ async def create_chat_completion(
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
+            prefetched_stream = await _prefetch_async_iterator(
+                stream_chat_completion(
+                    engine,
+                    messages,
+                    request,
+                    model_load_duration=model_load_duration,
+                    resolved_model=resolved_model,
+                    response_id=response_id,
+                    **chat_kwargs,
+                )
+            )
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
-                        stream_chat_completion(
-                            engine,
-                            messages,
-                            request,
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_id=response_id,
-                            **chat_kwargs,
-                        ),
+                        prefetched_stream,
                         http_request=http_request,
                         keepalive_chunk=keepalive,
                     ),
@@ -3536,7 +3556,8 @@ async def create_chat_completion(
                 headers=sse_headers,
             )
 
-        # Non-streaming response with keepalive during prefill
+        # Non-streaming response delayed until completion so typed media and
+        # prefill failures remain eligible for normal HTTP error handling.
         async def _build_chat_completion():
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
@@ -3558,11 +3579,7 @@ async def create_chat_completion(
                 f"request_max_tokens={request.max_tokens}"
             )
             first_token_at = getattr(output, "first_token_at", None)
-            ttft = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
-            )
+            ttft = (first_token_at - start_time) if first_token_at is not None else 0.0
             gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
@@ -3658,12 +3675,16 @@ async def create_chat_completion(
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
         )
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_chat_completion()),
-                lease,
-            ),
-            media_type="application/json",
+        try:
+            response_payload = await _run_with_disconnect_guard(
+                http_request, _build_chat_completion()
+            )
+        finally:
+            await lease.release()
+        if response_payload is None:
+            return Response(status_code=499)
+        return JSONResponse(
+            content=json.loads(response_payload),
             headers=json_headers,
         )
 
@@ -4360,6 +4381,14 @@ async def stream_chat_completion(
     # it); otherwise mint one for direct/non-streaming callers.
     response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
+    # Advance the engine before emitting the unconditional role chunk. Native
+    # media decoding and validation happen on this first advance; allowing the
+    # error to propagate keeps deterministic failures pre-response and lets
+    # FastAPI return the typed HTTP error instead of committing SSE 200 first.
+    engine_stream = await _prefetch_async_iterator(
+        engine.stream_chat(messages=messages, **kwargs)
+    )
+
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
@@ -4387,7 +4416,7 @@ async def stream_chat_completion(
         else:
             stream_content = False
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -5380,11 +5409,11 @@ async def create_anthropic_message(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -5871,11 +5900,11 @@ async def create_response(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,

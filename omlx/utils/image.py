@@ -34,15 +34,18 @@ _VIDEO_INPUT_ERROR = (
     "(data:video/...;base64,...). Remote URLs and local file paths are not supported."
 )
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
-MAX_VIDEO_FRAMES = 128
+DEFAULT_MAX_VIDEO_FRAMES = 128
+MAX_VIDEO_FRAMES = 768
 VIDEO_SAMPLE_FPS = 2.0
+MAX_VIDEO_SAMPLE_FPS = 16.0
 MAX_VIDEO_WIDTH = 4096
 MAX_VIDEO_HEIGHT = 2160
 MAX_VIDEO_FPS = 120.0
 MAX_VIDEO_DURATION_SECONDS = 300.0
 MAX_VIDEO_SOURCE_FRAMES = 36_000
 MAX_VIDEO_FRAME_PIXELS = 4096 * 2160
-MAX_VIDEO_DECODED_BYTES = 256 * 1024 * 1024
+DEFAULT_VIDEO_DECODED_BYTES = 256 * 1024 * 1024
+MAX_VIDEO_DECODED_BYTES = 1024 * 1024 * 1024
 MAX_VIDEO_DECODER_ALLOCATION_BYTES = 64 * 1024 * 1024
 VIDEO_DECODE_TIMEOUT_SECONDS = 45.0
 FFMPEG_BINARY = "/opt/homebrew/bin/ffmpeg"
@@ -178,6 +181,9 @@ def _validated_video_sample_count(
     fps: float,
     total_frames: float,
     field: str,
+    requested_fps: float | None = None,
+    requested_max_frames: int | None = None,
+    max_decoded_bytes: int | None = None,
 ) -> int:
     """Validate decoder metadata and return a bounded even sample count."""
     values = (width, height, fps, total_frames)
@@ -206,11 +212,43 @@ def _validated_video_sample_count(
     ):
         raise _video_limit_error(field)
 
+    sample_fps = VIDEO_SAMPLE_FPS if requested_fps is None else requested_fps
+    frame_ceiling = (
+        DEFAULT_MAX_VIDEO_FRAMES
+        if requested_max_frames is None
+        else requested_max_frames
+    )
+    decoded_ceiling = (
+        (
+            MAX_VIDEO_DECODED_BYTES
+            if requested_fps is not None or requested_max_frames is not None
+            else DEFAULT_VIDEO_DECODED_BYTES
+        )
+        if max_decoded_bytes is None
+        else max_decoded_bytes
+    )
+    if (
+        not isinstance(sample_fps, (int, float))
+        or isinstance(sample_fps, bool)
+        or not math.isfinite(sample_fps)
+        or sample_fps <= 0
+        or sample_fps > MAX_VIDEO_SAMPLE_FPS
+        or not isinstance(frame_ceiling, int)
+        or isinstance(frame_ceiling, bool)
+        or frame_ceiling < 2
+        or frame_ceiling > MAX_VIDEO_FRAMES
+        or not isinstance(decoded_ceiling, int)
+        or isinstance(decoded_ceiling, bool)
+        or decoded_ceiling <= 0
+        or decoded_ceiling > MAX_VIDEO_DECODED_BYTES
+    ):
+        raise _video_limit_error(field)
+
     frame_factor = 2
     minimum_frames = min(4, int_total_frames)
-    maximum_frames = min(MAX_VIDEO_FRAMES, int_total_frames)
+    maximum_frames = min(frame_ceiling, int_total_frames)
     maximum_frames -= maximum_frames % frame_factor
-    desired = int_total_frames / fps * VIDEO_SAMPLE_FPS
+    desired = int_total_frames / fps * sample_fps
     sample_count = min(max(desired, minimum_frames), maximum_frames)
     sample_count = math.floor(sample_count / frame_factor) * frame_factor
     if sample_count < frame_factor or sample_count > int_total_frames:
@@ -219,7 +257,7 @@ def _validated_video_sample_count(
     # Reserve one decoder frame and one RGB conversion frame in addition to
     # the retained output tensor so peak decoded memory stays within the cap.
     decoded_bytes = (sample_count + 2) * int_width * int_height * 3
-    if decoded_bytes > MAX_VIDEO_DECODED_BYTES:
+    if decoded_bytes > decoded_ceiling:
         raise _video_limit_error(field)
     return sample_count
 
@@ -229,6 +267,8 @@ def _decode_video_file_to_memmap(
     output_path: str,
     *,
     field: str,
+    requested_fps: float | None = None,
+    requested_max_frames: int | None = None,
 ) -> tuple[tuple[int, int, int, int], float]:
     """Decode bounded RGB frames with ffmpeg allocation controls."""
     import subprocess
@@ -253,6 +293,8 @@ def _decode_video_file_to_memmap(
             fps=fps,
             total_frames=total_frames,
             field=field,
+            requested_fps=requested_fps,
+            requested_max_frames=requested_max_frames,
         )
         int_width = int(width)
         int_height = int(height)
@@ -261,8 +303,7 @@ def _decode_video_file_to_memmap(
 
         select = "+".join(f"eq(n\\,{int(index)})" for index in indices)
         video_filter = (
-            f"select={select},"
-            f"scale={int_width}:{int_height}:flags=area,format=rgb24"
+            f"select={select},scale={int_width}:{int_height}:flags=area,format=rgb24"
         )
         command = [
             FFMPEG_BINARY,
@@ -323,7 +364,13 @@ def _decode_video_file_to_memmap(
         cap.release()
 
 
-def _load_video_file_bounded(path: str, *, field: str) -> tuple[Any, float]:
+def _load_video_file_bounded(
+    path: str,
+    *,
+    field: str,
+    requested_fps: float | None = None,
+    requested_max_frames: int | None = None,
+) -> tuple[Any, float]:
     """Decode video into one bounded memmap and return a zero-copy CHW view."""
     import numpy as np
 
@@ -331,9 +378,12 @@ def _load_video_file_bounded(path: str, *, field: str) -> tuple[Any, float]:
     output_path = output_file.name
     output_file.close()
     try:
-        shape, fps = _decode_video_file_to_memmap(
-            path, output_path, field=field
-        )
+        decode_kwargs: dict[str, Any] = {"field": field}
+        if requested_fps is not None:
+            decode_kwargs["requested_fps"] = requested_fps
+        if requested_max_frames is not None:
+            decode_kwargs["requested_max_frames"] = requested_max_frames
+        shape, fps = _decode_video_file_to_memmap(path, output_path, **decode_kwargs)
         frames_hwc = np.memmap(
             output_path,
             mode="r",
@@ -353,13 +403,24 @@ def _load_video_file_bounded(path: str, *, field: str) -> tuple[Any, float]:
             os.unlink(output_path)
 
 
-def load_video_data_uri(value: str, *, field: str = "video_url.url") -> VideoInput:
+def load_video_data_uri(
+    value: str,
+    *,
+    field: str = "video_url.url",
+    requested_fps: float | None = None,
+    requested_max_frames: int | None = None,
+) -> VideoInput:
     """Sample a bounded inline video without exposing filesystem reads."""
     raw, suffix = _decode_video_data_uri(value, field=field)
     with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
         tmp.write(raw)
         tmp.flush()
-        frames, fps = _load_video_file_bounded(tmp.name, field=field)
+        load_kwargs: dict[str, Any] = {"field": field}
+        if requested_fps is not None:
+            load_kwargs["requested_fps"] = requested_fps
+        if requested_max_frames is not None:
+            load_kwargs["requested_max_frames"] = requested_max_frames
+        frames, fps = _load_video_file_bounded(tmp.name, **load_kwargs)
     return VideoInput(
         frames=frames,
         fps=fps,
@@ -538,12 +599,18 @@ def _extract_media_from_messages(
                 if video_url_obj is None and isinstance(part, dict):
                     video_url_obj = part.get("input_video")
 
+                requested_fps = None
+                requested_max_frames = None
                 if isinstance(video_url_obj, str):
                     url = video_url_obj
                 elif isinstance(video_url_obj, dict):
                     url = video_url_obj.get("url")
+                    requested_fps = video_url_obj.get("fps")
+                    requested_max_frames = video_url_obj.get("max_frames")
                 elif video_url_obj is not None:
                     url = getattr(video_url_obj, "url", None)
+                    requested_fps = getattr(video_url_obj, "fps", None)
+                    requested_max_frames = getattr(video_url_obj, "max_frames", None)
                 else:
                     url = None
 
@@ -557,7 +624,13 @@ def _extract_media_from_messages(
                         "Only one video is supported per request.",
                         field="messages",
                     )
-                videos.append(load_video_data_uri(url))
+                videos.append(
+                    load_video_data_uri(
+                        url,
+                        requested_fps=requested_fps,
+                        requested_max_frames=requested_max_frames,
+                    )
+                )
 
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields

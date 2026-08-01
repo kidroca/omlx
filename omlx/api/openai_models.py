@@ -38,6 +38,8 @@ class VideoURL(BaseModel):
     """Inline video input for video-capable vision models."""
 
     url: str  # "data:video/mp4;base64,..."
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
 
 
 class InputAudio(BaseModel):
