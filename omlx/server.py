@@ -192,6 +192,7 @@ from .exceptions import (
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .request_logging import format_llm_completion_metrics
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -1494,6 +1495,38 @@ def _format_generation_speed_for_log(
     if steps > 0:
         parts.append(f"steps={steps}")
     return ", ".join(parts)
+
+
+def _format_chat_completion_metrics_for_log(
+    output,
+    *,
+    total_duration: float,
+    time_to_first_token: float,
+    generation_duration: float,
+    is_diffusion: bool,
+) -> str:
+    end_to_end_tps = (
+        output.completion_tokens / total_duration if total_duration > 0 else 0.0
+    )
+    if is_diffusion:
+        speed_text = _format_generation_speed_for_log(
+            output,
+            end_to_end_tps,
+            is_diffusion=True,
+        )
+        return (
+            f"{output.completion_tokens} tokens in {total_duration:.2f}s "
+            f"({speed_text}), prompt: {output.prompt_tokens}"
+        )
+
+    return format_llm_completion_metrics(
+        prompt_tokens=output.prompt_tokens,
+        cached_tokens=output.cached_tokens,
+        completion_tokens=output.completion_tokens,
+        time_to_first_token=time_to_first_token,
+        generation_duration=generation_duration,
+        total_duration=total_duration,
+    )
 
 
 def _resolve_metric_durations(
@@ -3556,19 +3589,7 @@ async def create_chat_completion(
             output = await engine.chat(messages=messages, **chat_kwargs)
 
             elapsed = time.perf_counter() - start_time
-            tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
             is_diffusion = getattr(engine, "is_diffusion_model", False)
-            speed_text = _format_generation_speed_for_log(
-                output,
-                tokens_per_sec,
-                is_diffusion=is_diffusion,
-            )
-            logger.info(
-                f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s "
-                f"({speed_text}), prompt: {output.prompt_tokens}, "
-                f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
-                f"request_max_tokens={request.max_tokens}"
-            )
             first_token_at = getattr(output, "first_token_at", None)
             ttft = (
                 (first_token_at - start_time)
@@ -3581,6 +3602,18 @@ async def create_chat_completion(
                 is_diffusion=is_diffusion,
                 prefill_duration=ttft,
                 generation_duration=gen_duration,
+            )
+            completion_metrics = _format_chat_completion_metrics_for_log(
+                output,
+                total_duration=elapsed,
+                time_to_first_token=ttft,
+                generation_duration=metric_gen_duration,
+                is_diffusion=is_diffusion,
+            )
+            logger.info(
+                f"Chat completion: {completion_metrics}, "
+                f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
+                f"request_max_tokens={request.max_tokens}"
             )
 
             get_server_metrics().record_request_complete(
@@ -4351,6 +4384,8 @@ async def stream_chat_completion(
     """
     start_time = time.perf_counter()
     first_token_time = None
+    last_token_time = None
+    last_completion_tokens = 0
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
@@ -4400,8 +4435,26 @@ async def stream_chat_completion(
             stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
-            if first_token_time is None and output.new_text:
-                first_token_time = time.perf_counter()
+            generated_at = getattr(output, "generated_at", None)
+            generated_until = getattr(output, "generated_until", None)
+            if first_token_time is None and generated_at is not None:
+                first_token_time = generated_at
+            if generated_until is not None:
+                last_token_time = generated_until
+            elif generated_at is not None:
+                last_token_time = generated_at
+            elif output.completion_tokens > last_completion_tokens:
+                # Compatibility fallback for engines that do not expose
+                # producer timestamps. Capture receipt before yielding so
+                # downstream consumer delays do not inflate the interval.
+                received_at = time.perf_counter()
+                if first_token_time is None:
+                    first_token_time = received_at
+                last_token_time = received_at
+            last_completion_tokens = max(
+                last_completion_tokens,
+                output.completion_tokens,
+            )
             last_output = output
             if output.new_text:
                 accumulated_text += output.new_text
@@ -4638,14 +4691,28 @@ async def stream_chat_completion(
 
     # Record metrics and emit usage chunk
     if last_output and last_output.finished:
-        end_time = time.perf_counter()
-        total_duration = end_time - start_time
-        ttft = (first_token_time - start_time) if first_token_time else total_duration
         is_diffusion = getattr(engine, "is_diffusion_model", False)
         if is_diffusion:
+            completed_at = time.perf_counter()
+            total_duration = max(completed_at - start_time, 0.0)
+            ttft = (
+                max(first_token_time - start_time, 0.0)
+                if first_token_time is not None
+                else total_duration
+            )
             gen_duration = total_duration
         else:
-            gen_duration = end_time - (first_token_time or start_time)
+            completed_at = last_token_time or time.perf_counter()
+            total_duration = max(completed_at - start_time, 0.0)
+            ttft = (
+                max(first_token_time - start_time, 0.0)
+                if first_token_time is not None
+                else total_duration
+            )
+            gen_duration = max(
+                completed_at - (first_token_time or start_time),
+                0.0,
+            )
         metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
             last_output,
             is_diffusion=is_diffusion,
@@ -4660,26 +4727,22 @@ async def stream_chat_completion(
             generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
         )
-        speed_duration = total_duration if is_diffusion else gen_duration
-        tokens_per_sec = (
-            last_output.completion_tokens / speed_duration if speed_duration > 0 else 0
-        )
-        speed_text = _format_generation_speed_for_log(
+        completion_metrics = _format_chat_completion_metrics_for_log(
             last_output,
-            tokens_per_sec,
+            total_duration=total_duration,
+            time_to_first_token=ttft,
+            generation_duration=metric_gen_duration,
             is_diffusion=is_diffusion,
         )
         logger.info(
-            f"Chat completion: {last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({speed_text}), "
-            f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
+            f"Chat completion: {completion_metrics}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
             f"request_max_tokens={request.max_tokens}"
         )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
-            total_time = end_time - start_time
+            total_time = total_duration
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
             usage_chunk = ChatCompletionChunk(
