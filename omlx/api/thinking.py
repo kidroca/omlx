@@ -213,6 +213,12 @@ def extract_thinking(
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
 
+    if start_in_thinking and not leading_only and text.startswith(_CLOSE_TAG):
+        second_close = text.find(_CLOSE_TAG, _CLOSE_LEN)
+        if second_close >= 0:
+            reasoning, content = extract_thinking(text[second_close + _CLOSE_LEN:], truncated=truncated)
+            return ((text[_CLOSE_LEN:second_close] + reasoning).strip(), content.strip())
+
     if start_in_thinking and not text.lstrip().startswith(_OPEN_TAG):
         text = _OPEN_TAG + text
 
@@ -300,8 +306,13 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self, start_in_thinking: bool = False, leading_only: bool = False):
+    def __init__(self, start_in_thinking: bool = False, leading_only: bool = False, defer_empty_initial_close: bool = False):
         self._in_thinking: bool = start_in_thinking
+        self._defer_empty_initial_close = bool(
+            start_in_thinking and defer_empty_initial_close and not leading_only
+        )
+        self._empty_initial_close_deferred = False
+        self._after_empty_initial_close: List[str] = []
         self._buffer: str = ""  # Buffer for potential partial tags
         # Leading-only (see ``leading_thinking_only``): tags count until the
         # leading block closes or the answer starts, then all text is content.
@@ -362,7 +373,23 @@ class ThinkingParser:
 
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
-                    self._close_thinking()
+                    if self._empty_initial_close_deferred:
+                        thinking_out.extend(self._after_empty_initial_close)
+                        self._after_empty_initial_close = []
+                        self._empty_initial_close_deferred = False
+                        self._close_thinking()
+                    elif (
+                        self._defer_empty_initial_close
+                        and self._in_thinking
+                        and not self._close_seen
+                        and not self._thinking_accumulated
+                        and not thinking_out
+                        and not self._content_emitted
+                    ):
+                        self._empty_initial_close_deferred = True
+                        self._in_thinking = False
+                    else:
+                        self._close_thinking()
                     i += _CLOSE_LEN
                     continue
 
@@ -379,7 +406,9 @@ class ThinkingParser:
 
                 # Not a tag, emit the '<' as regular content
                 self._text_seen = True
-                if self._in_thinking:
+                if self._empty_initial_close_deferred:
+                    self._after_empty_initial_close.append(text[i])
+                elif self._in_thinking:
                     thinking_out.append('<')
                 else:
                     content_out.append('<')
@@ -389,7 +418,9 @@ class ThinkingParser:
             else:
                 if not text[i].isspace():
                     self._text_seen = True
-                if self._in_thinking:
+                if self._empty_initial_close_deferred:
+                    self._after_empty_initial_close.append(text[i])
+                elif self._in_thinking:
                     thinking_out.append(text[i])
                 else:
                     content_out.append(text[i])
@@ -426,6 +457,14 @@ class ThinkingParser:
         """
         partial = self._buffer
         self._buffer = ""
+
+        if self._empty_initial_close_deferred:
+            content = "".join(self._after_empty_initial_close) + partial
+            self._after_empty_initial_close = []
+            self._empty_initial_close_deferred = False
+            self._close_seen = True
+            self._content_emitted = bool(content)
+            return ("", content)
 
         # Recovery: prompt opened a thinking block (or model echoed
         # ``<think>`` itself), the close tag never arrived, and nothing

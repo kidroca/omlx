@@ -6606,7 +6606,8 @@ async def stream_chat_completion(
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     leading_only = _leading_thinking_only(engine)
     thinking_parser = ThinkingParser(
-        start_in_thinking=start_in_thinking, leading_only=leading_only
+        start_in_thinking=start_in_thinking, leading_only=leading_only,
+        defer_empty_initial_close=(start_in_thinking and bool(kwargs.get("tools")) and not leading_only),
     )
 
     def mark_visible_delta() -> None:
@@ -7339,7 +7340,8 @@ async def stream_anthropic_messages(
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
     leading_only = _leading_thinking_only(engine)
     thinking_parser = ThinkingParser(
-        start_in_thinking=start_in_thinking, leading_only=leading_only
+        start_in_thinking=start_in_thinking, leading_only=leading_only,
+        defer_empty_initial_close=(start_in_thinking and bool(kwargs.get("tools")) and not leading_only),
     )
     thinking_block_started = False
     text_block_started = False
@@ -9089,7 +9091,8 @@ async def stream_responses_api(
         logger.debug("Could not detect Responses stream thinking state: %s", exc)
     leading_only = _leading_thinking_only(engine)
     thinking_parser = ThinkingParser(
-        start_in_thinking=start_in_thinking, leading_only=leading_only
+        start_in_thinking=start_in_thinking, leading_only=leading_only,
+        defer_empty_initial_close=(start_in_thinking and bool(kwargs.get("tools")) and not leading_only),
     )
     stream_state = stream_state or _ResponsesStreamState()
     seq = 0
