@@ -17,6 +17,53 @@ _VENDOR_MLX_VLM = Path(__file__).resolve().parent / "vendor" / "mlx_vlm"
 _APPLIED = False
 
 
+def _patch_transformers_mtp_layer_validation() -> None:
+    """Allow GLM-5.3 checkpoints to describe separate MTP MLP layers.
+
+    Transformers validates ``mlp_layer_types`` against the base transformer
+    layer count.  GLM-5.3 MLX checkpoints append one entry per next-token
+    prediction layer, so temporarily hide only that exact suffix while the
+    upstream validator runs.  The original list remains available to loaders.
+    """
+    from transformers.models.glm5_next.configuration_glm5_next import (
+        Glm5NextTextConfig,
+    )
+
+    original = Glm5NextTextConfig.validate_layer_type
+    if getattr(original, "_omlx_glm5_next_mtp_compat", False):
+        return
+
+    def validate_layer_type(config: Any) -> None:
+        mlp_layer_types = getattr(config, "mlp_layer_types", None)
+        num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0)
+        allow_mtp_suffix = (
+            isinstance(mlp_layer_types, list)
+            and isinstance(num_hidden_layers, int)
+            and isinstance(num_nextn_predict_layers, int)
+            and num_nextn_predict_layers > 0
+            and len(mlp_layer_types)
+            == num_hidden_layers + num_nextn_predict_layers
+        )
+        if not allow_mtp_suffix:
+            original(config)
+            return
+
+        config.mlp_layer_types = mlp_layer_types[:num_hidden_layers]
+        try:
+            original(config)
+        finally:
+            config.mlp_layer_types = mlp_layer_types
+
+    validate_layer_type._omlx_glm5_next_mtp_compat = True  # type: ignore[attr-defined]
+    Glm5NextTextConfig.validate_layer_type = validate_layer_type
+    validators = Glm5NextTextConfig.__class_validators__
+    Glm5NextTextConfig.__class_validators__ = tuple(
+        validate_layer_type if validator is original else validator
+        for validator in validators
+    )
+
+
 def _append_package_path(package: Any, path: Path) -> None:
     package_path = getattr(package, "__path__", None)
     if package_path is None:
@@ -39,6 +86,7 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         from omlx.patches.deepseek_v4 import apply_pooling_cache_support
 
         apply_pooling_cache_support()
+        _patch_transformers_mtp_layer_validation()
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
         # Discovery may import upstream first; reload from the vendor path.
