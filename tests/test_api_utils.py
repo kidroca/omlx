@@ -2842,6 +2842,45 @@ class TestExtractMultimodalContent:
             "input_audio": {"data": "abc", "format": "wav"},
         }
 
+    def test_video_url_pass_through(self):
+        """OpenAI video_url parts survive API-boundary normalization."""
+        url = "data:video/mp4;base64,AAAA"
+        parts = _extract_multimodal_content_list(
+            [{"type": "video_url", "video_url": {"url": url}}]
+        )
+
+        assert parts == [
+            {"type": "video_url", "video_url": {"url": url}},
+        ]
+
+    def test_extract_multimodal_content_preserves_video_message(self):
+        """A video-bearing message must not be flattened to text-only."""
+        url = "data:video/mp4;base64,AAAA"
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    ContentPart(type="text", text="Describe the sequence"),
+                    ContentPart(
+                        type="video_url",
+                        video_url={"url": url},
+                    ),
+                ],
+            )
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the sequence"},
+                    {"type": "video_url", "video_url": {"url": url}},
+                ],
+            }
+        ]
+
     def test_input_audio_non_dict_dropped(self):
         """input_audio with non-dict data is dropped."""
         parts = _extract_multimodal_content_list(

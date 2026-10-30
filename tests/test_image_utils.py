@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
+import omlx.utils.image as image_utils
 from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import (
     compute_image_hash,
@@ -417,6 +418,114 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         # Text content should be preserved
         assert "Describe this image and audio" in text_msgs[0]["content"]
+
+
+class TestExtractMediaFromMessages:
+    """Tests for native inline-video extraction."""
+
+    def test_video_url_is_decoded_loaded_and_removed_from_text(self):
+        raw_video = b"small synthetic mp4 payload"
+        uri = "data:video/mp4;base64," + base64.b64encode(raw_video).decode()
+        observed = {}
+
+        def fake_load_video(path, *, fps, max_frames):
+            observed["path"] = path
+            observed["bytes"] = open(path, "rb").read()
+            observed["fps"] = fps
+            observed["max_frames"] = max_frames
+            return "frames", 1.75
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                    {"type": "text", "text": "Describe this video"},
+                ],
+            }
+        ]
+
+        with patch("mlx_vlm.utils.load_video", side_effect=fake_load_video):
+            text_msgs, images, audio, videos = image_utils.extract_media_from_messages(
+                messages
+            )
+
+        assert text_msgs == [{"role": "user", "content": "Describe this video"}]
+        assert images == []
+        assert audio == []
+        assert len(videos) == 1
+        assert videos[0].frames == "frames"
+        assert videos[0].fps == 1.75
+        assert observed["bytes"] == raw_video
+        assert observed["fps"] == 2.0
+        assert observed["max_frames"] == 128
+        assert not __import__("pathlib").Path(observed["path"]).exists()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/video.mp4",
+            "/tmp/video.mp4",
+            "data:image/png;base64,AAAA",
+            "data:video/mp4;base64,not-valid-base64!!!",
+        ],
+    )
+    def test_video_url_rejects_non_inline_or_malformed_inputs(self, url):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_more_than_one_video(self):
+        uri = "data:video/mp4;base64," + base64.b64encode(b"video").decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="one video"):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_video_outside_user_message(self):
+        uri = "data:video/mp4;base64," + base64.b64encode(b"video").decode()
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="user messages"):
+            image_utils.extract_media_from_messages(messages)
+
+    def test_rejects_oversized_video_before_decode(self, monkeypatch):
+        monkeypatch.setattr(image_utils, "MAX_VIDEO_BYTES", 3)
+        uri = "data:video/mp4;base64," + base64.b64encode(b"four").decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                ],
+            }
+        ]
+
+        with pytest.raises(InvalidRequestError, match="exceeds"):
+            image_utils.extract_media_from_messages(messages)
 
 
 # =============================================================================

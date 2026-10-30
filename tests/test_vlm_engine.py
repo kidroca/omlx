@@ -30,6 +30,45 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
+def test_torch_free_video_patch_preserves_mlx_vlm_processor(monkeypatch):
+    """Keep mlx-vlm's NumPy video processor while dropping HF's kwarg."""
+    import omlx.engine.vlm as vlm_module
+    from transformers.processing_utils import (
+        MODALITY_TO_AUTOPROCESSOR_MAPPING,
+        ProcessorMixin,
+    )
+
+    mapping = dict(MODALITY_TO_AUTOPROCESSOR_MAPPING._MAPPING_NAMES)
+    monkeypatch.setattr(
+        MODALITY_TO_AUTOPROCESSOR_MAPPING,
+        "_MAPPING_NAMES",
+        mapping,
+    )
+    monkeypatch.setattr(vlm_module, "_video_processor_patched", False)
+
+    init_kwargs = []
+
+    def fake_init(self, *args, **kwargs):
+        init_kwargs.append(kwargs)
+
+    monkeypatch.setattr(ProcessorMixin, "__init__", fake_init)
+
+    class NumpyVideoProcessor:
+        __module__ = "mlx_vlm.models.qwen3_vl.processing_qwen3_vl"
+
+    vlm_module._patch_video_processor_bug()
+    video_processor = NumpyVideoProcessor()
+    processor = ProcessorMixin.__new__(ProcessorMixin)
+    ProcessorMixin.__init__(processor, object(), object(), video_processor)
+
+    assert "video_processor" not in init_kwargs[0]
+    assert processor.video_processor is video_processor
+
+    unsafe_processor = ProcessorMixin.__new__(ProcessorMixin)
+    ProcessorMixin.__init__(unsafe_processor, video_processor=object())
+    assert unsafe_processor.video_processor is None
+
+
 class MockVLMTokenizer:
     """Mock that mimics mlx-vlm's TokenizerWrapper __getattr__ delegation.
 
@@ -1014,11 +1053,11 @@ class TestApplyOcrPrompt:
 class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
-    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.extract_media_from_messages")
     def test_text_only_uses_vlm_prepare_path(self, mock_extract):
         """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [], [])
+        mock_extract.return_value = (text_msgs, [], [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -1046,15 +1085,16 @@ class TestProcessChatMessages:
             text_msgs,
             [],
             audio=None,
+            videos=None,
             chat_template_kwargs=None,
             tools=None,
         )
 
-    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.extract_media_from_messages")
     def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
         """Text-only + tools still convert and pass tools through VLM path."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [], [])
+        mock_extract.return_value = (text_msgs, [], [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -1072,14 +1112,14 @@ class TestProcessChatMessages:
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] == [{"converted": True}]
 
-    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.extract_media_from_messages")
     def test_image_path_calls_prepare_vision(self, mock_extract):
         """Messages with images → _prepare_vision_inputs() called."""
         from PIL import Image
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1116,14 +1156,14 @@ class TestProcessChatMessages:
         assert image_cache_key_start == 12
         assert image_cache_key_ranges == [(12, "hash123")]
 
-    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.extract_media_from_messages")
     def test_image_path_passes_tools(self, mock_extract):
         """Image + tools → tools converted and passed to _prepare_vision_inputs()."""
         from PIL import Image
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1145,14 +1185,14 @@ class TestProcessChatMessages:
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] == [{"converted": True}]
 
-    @patch("omlx.engine.vlm.extract_images_from_messages")
+    @patch("omlx.engine.vlm.extract_media_from_messages")
     def test_image_path_without_tools(self, mock_extract):
         """Image + tools=None → _prepare_vision_inputs(tools=None)."""
         from PIL import Image
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1165,6 +1205,41 @@ class TestProcessChatMessages:
 
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
+
+    @patch("omlx.engine.vlm.extract_media_from_messages")
+    def test_video_path_passes_sampled_video_to_prepare_inputs(self, mock_extract):
+        """A video_url request reaches the native mlx-vlm video input path."""
+        video = SimpleNamespace(frames="sampled-frames", fps=1.75)
+        text_msgs = [{"role": "user", "content": "Describe the video"}]
+        mock_extract.return_value = (text_msgs, [], [], [video])
+
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], MagicMock(), {}, None, 0, [])
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "data:video/mp4;base64,x"},
+                    },
+                    {"type": "text", "text": "Describe the video"},
+                ],
+            }
+        ]
+
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        engine._prepare_vision_inputs.assert_called_once_with(
+            messages,
+            [],
+            audio=None,
+            videos=[video],
+            chat_template_kwargs=None,
+            tools=None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1359,36 @@ class TestPrepareVisionInputs:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_video_passed_to_prepare_inputs_and_model(self, mock_vlm_act, mock_prepare):
+        """Sampled frames and video metadata reach native model embeddings."""
+        engine = self._setup_engine_for_vision(model_type="qwen3_5")
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        video_pixels = mx.ones((1, 2, 2))
+        video_grid = mx.array([[1, 1, 1]])
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+            "pixel_values_videos": video_pixels,
+            "video_grid_thw": video_grid,
+        }
+        video = SimpleNamespace(frames="sampled-frames", fps=1.75)
+
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe"}],
+            [],
+            videos=[video],
+        )
+
+        prepare_kwargs = mock_prepare.call_args.kwargs
+        assert prepare_kwargs["videos"] == ["sampled-frames"]
+        assert prepare_kwargs["fps"] == 1.75
+        embedding_kwargs = engine._vlm_model.get_input_embeddings.call_args.kwargs
+        assert embedding_kwargs["pixel_values_videos"] is video_pixels
+        assert embedding_kwargs["video_grid_thw"] is video_grid
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
     ):
@@ -1387,6 +1492,44 @@ class TestFormatMessagesForVLMTemplate:
                 count += content.count("<start_of_image>")
                 count += content.count("<|image_1|>")
         return count
+
+    @staticmethod
+    def _count_video_placeholders(formatted_messages):
+        count = 0
+        for msg in formatted_messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "video":
+                        count += 1
+        return count
+
+    def test_places_video_placeholder_on_video_user_turn(self):
+        """video_url parts become native processor video markers."""
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "data:video/mp4;base64,abc"},
+                    },
+                    {"type": "text", "text": "What happens?"},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages,
+            num_images=0,
+            num_videos=1,
+        )
+
+        assert self._count_video_placeholders(formatted) == 1
+        assert self._count_video_placeholders([formatted[-1]]) == 1
+        assert image_ranges == []
 
     def test_assigns_placeholder_to_late_user_image_turn(self):
         """system→assistant→user(image) still places image token on user turn."""

@@ -11,6 +11,8 @@ import base64
 import binascii
 import hashlib
 import io
+import tempfile
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
@@ -26,6 +28,21 @@ _AUDIO_INPUT_ERROR = (
     "input_audio.data must be a base64 string or base64 data URI. "
     "Local file paths are not supported."
 )
+_VIDEO_INPUT_ERROR = (
+    "Video inputs must be base64 data URIs "
+    "(data:video/...;base64,...). Remote URLs and local file paths are not supported."
+)
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
+MAX_VIDEO_FRAMES = 128
+VIDEO_SAMPLE_FPS = 2.0
+
+
+@dataclass(frozen=True)
+class VideoInput:
+    """Decoded frames and their effective sampling rate."""
+
+    frames: Any
+    fps: float
 
 
 def _decode_base64_data_uri(value: str, *, field: str) -> bytes:
@@ -77,6 +94,86 @@ def _decode_input_audio_data(data: str, *, field: str = "input_audio.data") -> b
         raise InvalidRequestError(_AUDIO_INPUT_ERROR, field=field) from exc
 
 
+def _decode_video_data_uri(
+    value: str,
+    *,
+    field: str = "video_url.url",
+) -> tuple[bytes, str]:
+    """Decode one inline video while rejecting paths, URLs, and oversized payloads."""
+    if not isinstance(value, str):
+        raise InvalidRequestError(_VIDEO_INPUT_ERROR, field=field)
+
+    stripped = value.strip()
+    if not stripped.startswith("data:"):
+        raise InvalidRequestError(_VIDEO_INPUT_ERROR, field=field)
+
+    prefix, separator, encoded = stripped.partition(",")
+    prefix_lower = prefix.lower()
+    if (
+        separator != ","
+        or not prefix_lower.startswith("data:video/")
+        or ";base64" not in prefix_lower
+    ):
+        raise InvalidRequestError(
+            f"{field} must use a base64 video data URI.",
+            field=field,
+        )
+
+    max_encoded_size = ((MAX_VIDEO_BYTES + 2) // 3) * 4
+    if len(encoded) > max_encoded_size:
+        raise InvalidRequestError(
+            f"{field} exceeds the {MAX_VIDEO_BYTES // (1024 * 1024)} MiB limit.",
+            field=field,
+        )
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidRequestError(
+            f"{field} contains invalid base64 data.",
+            field=field,
+        ) from exc
+    if not raw:
+        raise InvalidRequestError(f"{field} is empty.", field=field)
+    if len(raw) > MAX_VIDEO_BYTES:
+        raise InvalidRequestError(
+            f"{field} exceeds the {MAX_VIDEO_BYTES // (1024 * 1024)} MiB limit.",
+            field=field,
+        )
+
+    media_type = prefix_lower[5:].split(";", 1)[0]
+    suffix = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/mpeg": ".mpeg",
+        "video/x-msvideo": ".avi",
+    }.get(media_type, ".video")
+    return raw, suffix
+
+
+def load_video_data_uri(value: str, *, field: str = "video_url.url") -> VideoInput:
+    """Sample an inline video using mlx-vlm without exposing filesystem reads."""
+    raw, suffix = _decode_video_data_uri(value, field=field)
+    from mlx_vlm.utils import load_video
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+            tmp.write(raw)
+            tmp.flush()
+            frames, fps = load_video(
+                tmp.name,
+                fps=VIDEO_SAMPLE_FPS,
+                max_frames=MAX_VIDEO_FRAMES,
+            )
+    except ValueError as exc:
+        raise InvalidRequestError(
+            f"{field} does not contain a decodable video.",
+            field=field,
+        ) from exc
+    return VideoInput(frames=frames, fps=float(fps))
+
+
 def validate_image_data_uri(value: str, *, field: str = "image") -> str:
     """Validate that a request-facing image reference is an inline data URI."""
     _decode_base64_data_uri(value, field=field)
@@ -115,30 +212,60 @@ def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     return img.convert("RGB")
 
 
-def extract_images_from_messages(
+def _extract_media_from_messages(
     messages: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Image.Image], List]:
+    *,
+    include_videos: bool,
+) -> Tuple[List[Dict[str, Any]], List[Image.Image], List, List[VideoInput]]:
     """
-    Extract images and audio from OpenAI-format messages.
+    Extract images, audio, and optionally video from OpenAI-format messages.
 
-    Processes messages containing content arrays with image_url or input_audio
-    parts, loads the media, and returns cleaned text-only messages alongside
-    the loaded images and audio files.
+    Processes messages containing content arrays with image_url, input_audio,
+    or video_url parts, loads the media, and returns cleaned text-only messages
+    alongside the loaded media.
 
     Args:
         messages: List of OpenAI-format chat messages. Each message may have
             content as a string or a list of content parts
-            (text/image_url/input_audio).
+            (text/image_url/input_audio/video_url).
+        include_videos: Whether to decode and return video_url parts.
 
     Returns:
-        Tuple of (text_messages, images, audio):
+        Tuple of (text_messages, images, audio, videos):
         - text_messages: Messages with media parts removed, text parts joined
         - images: List of loaded PIL Image objects in order of appearance
         - audio: List of BytesIO audio buffers
+        - videos: List containing at most one sampled VideoInput
     """
     text_messages = []
     images = []
     audio = []
+    videos: list[VideoInput] = []
+
+    if include_videos:
+        video_parts = 0
+        for message in messages:
+            content = message.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                part_type = (
+                    part.get("type")
+                    if isinstance(part, dict)
+                    else getattr(part, "type", None)
+                )
+                if part_type in ("video_url", "input_video"):
+                    if message.get("role", "user") != "user":
+                        raise InvalidRequestError(
+                            "Video input is only supported in user messages.",
+                            field="messages",
+                        )
+                    video_parts += 1
+        if video_parts > 1:
+            raise InvalidRequestError(
+                "Only one video is supported per request.",
+                field="messages",
+            )
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -209,6 +336,36 @@ def extract_images_from_messages(
                     else:
                         audio.append(data)
 
+            elif part_type in ("video_url", "input_video") and include_videos:
+                video_url_obj = (
+                    part.get("video_url")
+                    if isinstance(part, dict)
+                    else getattr(part, "video_url", None)
+                )
+                if video_url_obj is None and isinstance(part, dict):
+                    video_url_obj = part.get("input_video")
+
+                if isinstance(video_url_obj, str):
+                    url = video_url_obj
+                elif isinstance(video_url_obj, dict):
+                    url = video_url_obj.get("url")
+                elif video_url_obj is not None:
+                    url = getattr(video_url_obj, "url", None)
+                else:
+                    url = None
+
+                if not url:
+                    raise InvalidRequestError(
+                        "video_url.url is required.",
+                        field="video_url.url",
+                    )
+                if videos:
+                    raise InvalidRequestError(
+                        "Only one video is supported per request.",
+                        field="messages",
+                    )
+                videos.append(load_video_data_uri(url))
+
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields
         for key in msg:
@@ -216,6 +373,24 @@ def extract_images_from_messages(
                 new_msg[key] = msg[key]
         text_messages.append(new_msg)
 
+    return text_messages, images, audio, videos
+
+
+def extract_media_from_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Image.Image], List, List[VideoInput]]:
+    """Extract all request media, including one inline video."""
+    return _extract_media_from_messages(messages, include_videos=True)
+
+
+def extract_images_from_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Image.Image], List]:
+    """Backward-compatible image/audio extractor that ignores video parts."""
+    text_messages, images, audio, _ = _extract_media_from_messages(
+        messages,
+        include_videos=False,
+    )
     return text_messages, images, audio
 
 
